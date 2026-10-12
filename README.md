@@ -52,6 +52,12 @@ The GitHub Actions workflow in `.github/workflows/build.yml` also builds `snapcl
 
 Startup flags: `--capture`, `--clipboard`, `--settings`. Each opens that window when the app starts.
 
+## Troubleshooting
+
+- Started by hand, SnapClip opens its Settings window. Started at sign-in, it stays in the tray. Windows 11 may hide new tray icons under the `^` arrow.
+- Launching it again while it runs brings up Settings in the running copy. `--capture` and `--clipboard` work the same way.
+- Errors and crashes are written to `%LOCALAPPDATA%\SnapClip\snapclip.log`.
+
 ## Where data lives
 
 - Settings: `%APPDATA%\SnapClip\settings.json` (Linux: `~/.config/SnapClip/`)
@@ -60,7 +66,8 @@ Startup flags: `--capture`, `--clipboard`, `--settings`. Each opens that window 
 
 ## Design notes
 
-- Every window is created when it opens and destroyed when it closes, together with its OpenGL context. While idle, the app is only the tray icon, the hotkeys and a clipboard listener.
+- Every window is created when it opens and destroyed when it closes, together with its graphics device. While idle, the app is only the tray icon, the hotkeys and a clipboard listener.
+- Rendering uses wgpu: DirectX 12 on Windows, falling back to Windows' built-in software renderer when there is no GPU driver (VMs, Remote Desktop).
 - The clipboard listener uses `AddClipboardFormatListener` on Windows, so it reacts to events instead of polling.
 - Annotations are stored in screenshot pixel coordinates and rendered twice: live with egui, and into the final image with tiny-skia. Text uses the same font in both, so the saved file matches the screen.
 
