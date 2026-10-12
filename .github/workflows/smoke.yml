@@ -1,0 +1,70 @@
+name: smoke-test
+
+# Runs a released snapclip.exe on a clean Windows machine and collects
+# its log, crash events and screenshots. Trigger manually:
+#   gh workflow run smoke.yml -f tag=v0.1.0-beta.1
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to test (empty = build from this commit)
+        required: false
+        default: ""
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get the exe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory app, out | Out-Null
+          if ("${{ inputs.tag }}") {
+            gh release download "${{ inputs.tag }}" -p "*.exe" -D app
+          } else {
+            cargo build --release
+            Copy-Item target/release/snapclip.exe app/
+          }
+          Get-ChildItem app
+
+      - name: Run and observe
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          function Shot($name) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("out/$name.png")
+          }
+          $exe = (Get-ChildItem app/*.exe | Select-Object -First 1).FullName
+
+          foreach ($mode in "--settings", "--clipboard", "--capture") {
+            Write-Host "=== $mode ==="
+            $p = Start-Process $exe -ArgumentList $mode -PassThru
+            Start-Sleep 8
+            $p.Refresh()
+            Write-Host "running: $(-not $p.HasExited)  exit code: $($p.ExitCode)"
+            Shot ($mode.TrimStart('-'))
+            Get-Content "$env:LOCALAPPDATA\SnapClip\snapclip.log" -ErrorAction SilentlyContinue |
+              Tee-Object -FilePath "out/log-$($mode.TrimStart('-')).txt"
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep 2
+          }
+
+          Write-Host "=== OpenGL info ==="
+          Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion
+
+          Write-Host "=== Application errors ==="
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 2 } -MaxEvents 10 -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, ProviderName, Message | Tee-Object -FilePath out/events.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-results
+          path: out
