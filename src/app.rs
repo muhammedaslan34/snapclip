@@ -236,8 +236,15 @@ impl App {
         let attrs = popup_attributes("SnapClip capture")
             .with_resizable(false)
             .with_position(PhysicalPosition::new(pos.0, pos.1))
-            .with_inner_size(PhysicalSize::new(image.width(), image.height()))
-            .with_fullscreen(Some(Fullscreen::Borderless(target)));
+            .with_inner_size(PhysicalSize::new(image.width(), image.height()));
+        // On Windows a borderless window placed over the monitor is enough, and winit's
+        // fullscreen mode breaks DirectX swap-chain creation on some drivers. Wayland
+        // can't position windows, so it needs real fullscreen.
+        let attrs = if cfg!(windows) {
+            attrs
+        } else {
+            attrs.with_fullscreen(Some(Fullscreen::Borderless(target)))
+        };
         let view = CaptureView::new(image, pos, &self.shared.settings);
         self.open(event_loop, attrs, Box::new(view));
     }

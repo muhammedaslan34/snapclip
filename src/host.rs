@@ -95,6 +95,10 @@ impl HostWindow {
         if let Some(state) = painter.render_state() {
             let info = state.adapter.get_info();
             log::info!("rendering with {} ({:?})", info.name, info.backend);
+            // wgpu panics on errors by default; a glitchy frame is better than a crash.
+            state
+                .device
+                .on_uncaptured_error(Arc::new(|err| log::error!("graphics error: {err}")));
         }
 
         let egui_winit = egui_winit::State::new(

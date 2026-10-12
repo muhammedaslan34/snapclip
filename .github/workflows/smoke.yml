@@ -56,6 +56,15 @@ jobs:
             Start-Sleep 2
           }
 
+          Write-Host "=== second launch ==="
+          $first = Start-Process $exe -PassThru
+          Start-Sleep 6
+          Start-Process $exe -ArgumentList "--clipboard" -Wait
+          Start-Sleep 3
+          Write-Host "instances: $((Get-Process | Where-Object { $_.Path -eq $exe }).Count)"
+          Shot "second-launch"
+          Stop-Process -Id $first.Id -Force -ErrorAction SilentlyContinue
+
           Write-Host "=== OpenGL info ==="
           Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion
 
