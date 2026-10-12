@@ -18,6 +18,13 @@ It is written in Rust with egui. It runs in the system tray, starts with Windows
 - Keeps text and images. Search, pin, edit, delete.
 - `Enter` or a click pastes into the window you were using. `Ctrl+1…9` pastes the first nine items. `Shift+Del` deletes, `Ctrl+P` pins, `Ctrl+E` edits.
 
+## Download
+
+Get the latest Windows build from the [Releases page](https://github.com/muhammedaslan34/snapclip/releases).
+Pick `SnapClip-<version>-windows-x64.exe`. It's a single file with nothing to install.
+Put it in a permanent folder before the first run, because it registers itself to start with Windows from that location.
+The file isn't code-signed yet, so SmartScreen will warn: click **More info → Run anyway**.
+
 ## Shortcuts
 
 Every shortcut can be changed in **Settings → Keyboard shortcuts**. That includes the two global ones, the screenshot tools and actions, and the clipboard panel keys.
@@ -61,3 +68,15 @@ Startup flags: `--capture`, `--clipboard`, `--settings`. Each opens that window 
 
 - Global shortcuts work on X11 only. On Wayland, use the tray menu for now. Forwarding `--capture` to an already-running instance is not implemented yet.
 - Auto-paste and auto-scroll are Windows-only. On Linux the item is copied and you paste it yourself.
+
+## Releasing
+
+1. Bump `version` in `Cargo.toml` (e.g. `0.2.0`) and commit.
+2. Tag and push:
+   ```sh
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+3. `.github/workflows/release.yml` runs the tests, builds `snapclip.exe` on Windows, and publishes a GitHub Release with the `.exe`, a `.zip` and `SHA256SUMS.txt`. Release notes are generated from the commits.
+
+The tag must match the `Cargo.toml` version, or the release job fails. A tag with a suffix, like `v0.2.0-beta.1`, is published as a pre-release.

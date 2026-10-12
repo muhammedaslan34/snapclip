@@ -1,0 +1,53 @@
+name: release
+
+# Push a tag like v0.1.0 to build Windows binaries and publish a GitHub Release.
+# Tags with a suffix (v0.2.0-beta.1) are published as pre-releases.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "${tag%%-*}" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - run: cargo test
+      - run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "SnapClip-${{ github.ref_name }}-windows-x64"
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/snapclip.exe "dist/$name.exe"
+          Compress-Archive -Path target/release/snapclip.exe, README.md -DestinationPath "dist/$name.zip"
+          Get-FileHash dist/* -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content dist/SHA256SUMS.txt
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          [[ "$GITHUB_REF_NAME" == *-* ]] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "SnapClip $GITHUB_REF_NAME" \
+            --generate-notes "${flags[@]}"
