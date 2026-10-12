@@ -5,7 +5,7 @@ mod app;
 mod capture;
 mod clip_panel;
 mod clip_watch;
-mod gl_window;
+mod host;
 mod history;
 mod hotkeys;
 mod icon;
@@ -24,17 +24,37 @@ use winit::event_loop::{ControlFlow, EventLoop};
 fn main() -> anyhow::Result<()> {
     let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     // Release builds have no console, so write the log next to the app data instead.
+    // A second launch must not wipe the running instance's log.
     if !cfg!(debug_assertions) {
         let dir = settings::data_dir();
         history::ensure_dir(&dir);
-        if let Ok(file) = std::fs::File::create(dir.join("snapclip.log")) {
+        let first = platform::single_instance_probe();
+        let file = if first {
+            std::fs::File::create(dir.join("snapclip.log"))
+        } else {
+            std::fs::OpenOptions::new().append(true).create(true).open(dir.join("snapclip.log"))
+        };
+        if let Ok(file) = file {
             logger.target(env_logger::Target::Pipe(Box::new(file)));
         }
     }
     logger.init();
 
+    // A crash should never be silent: log it and tell the user.
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("crash: {info}");
+        platform::error_box(&format!(
+            "SnapClip crashed:\n\n{info}\n\nDetails are in {}",
+            settings::data_dir().join("snapclip.log").display()
+        ));
+    }));
+
     let Some(_instance_lock) = platform::single_instance_lock() else {
-        log::info!("{} is already running", settings::APP_NAME);
+        // Already running: ask that instance to show itself instead.
+        let request = platform::Request::from_args().unwrap_or(platform::Request::Settings);
+        if !platform::send_request(request) {
+            log::info!("{} is already running", settings::APP_NAME);
+        }
         return Ok(());
     };
 

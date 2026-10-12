@@ -78,3 +78,20 @@ pub fn tray_icon() -> Option<tray_icon::Icon> {
 pub fn window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(rgba(64), 64, 64).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    /// Regenerates `assets/snapclip.ico` sources:
+    /// `ICON_OUT=/tmp/icons cargo test export_icon_pngs -- --ignored`,
+    /// then combine the PNGs with ImageMagick (see `assets/README.md`).
+    #[test]
+    #[ignore]
+    fn export_icon_pngs() {
+        let dir = std::path::PathBuf::from(std::env::var("ICON_OUT").expect("set ICON_OUT"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for size in [16, 20, 24, 32, 40, 48, 64, 128, 256] {
+            let img = image::RgbaImage::from_raw(size, size, super::rgba(size)).unwrap();
+            img.save(dir.join(format!("icon-{size}.png"))).unwrap();
+        }
+    }
+}

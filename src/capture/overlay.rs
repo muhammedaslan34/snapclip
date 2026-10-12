@@ -8,7 +8,7 @@ use image::RgbaImage;
 use super::annot::{self, Annot, Mapper, SelShape, Selection, Shape, Tool};
 use super::render;
 use crate::app::Command;
-use crate::gl_window::{Cx, View, ViewKind};
+use crate::host::{Cx, View, ViewKind};
 use crate::shortcuts::Act;
 use crate::theme::ACCENT;
 

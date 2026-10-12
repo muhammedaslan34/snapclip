@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use egui::{CollapsingHeader, Event, Grid, RichText, TextEdit};
 
 use crate::app::Command;
-use crate::gl_window::{Cx, View, ViewKind};
+use crate::host::{Cx, View, ViewKind};
 use crate::settings::{AfterCapture, Settings};
 use crate::shortcuts::{self, Act, Group, Keymap};
 

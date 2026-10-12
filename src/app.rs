@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crate::capture::{Action, CaptureView};
 use crate::clip_panel::ClipboardView;
 use crate::clip_watch::{self, ClipEvent};
-use crate::gl_window::{HostWindow, View, ViewKind};
+use crate::host::{HostWindow, View, ViewKind};
 use crate::history::{ClipContent, History};
 use crate::hotkeys::{HotkeyAction, Hotkeys};
 use crate::pin::PinView;
@@ -40,6 +40,8 @@ pub enum AppEvent {
     Repaint(WindowId, Duration),
     SaveFolderPicked(PathBuf),
     Scroll(ScrollMsg),
+    /// Sent by a second launch of the app.
+    Request(platform::Request),
 }
 
 /// Requests from views, executed by the app after the frame.
@@ -145,7 +147,10 @@ impl App {
                 window.window.request_redraw();
                 self.windows.insert(id, window);
             }
-            Err(err) => log::error!("cannot open window: {err:#}"),
+            Err(err) => {
+                log::error!("cannot open window: {err:#}");
+                platform::error_box(&format!("SnapClip could not open a window:\n\n{err:#}"));
+            }
         }
     }
 
@@ -168,6 +173,14 @@ impl App {
     fn redraw_kind(&self, kind: ViewKind) {
         if let Some(w) = self.find(kind).and_then(|id| self.windows.get(&id)) {
             w.window.request_redraw();
+        }
+    }
+
+    fn handle_request(&mut self, event_loop: &ActiveEventLoop, request: platform::Request) {
+        match request {
+            platform::Request::Settings => self.open_settings(event_loop),
+            platform::Request::Capture => self.open_capture(event_loop),
+            platform::Request::Clipboard => self.toggle_clipboard(event_loop),
         }
     }
 
@@ -516,14 +529,16 @@ impl ApplicationHandler<AppEvent> for App {
             tray::install_event_handlers(&self.proxy);
             self.tray = tray::create();
             log::info!("{APP_NAME} is running in the background");
-            // Handy for testing, and for desktops without global shortcut support.
-            for arg in std::env::args().skip(1) {
-                match arg.as_str() {
-                    "--capture" => self.open_capture(event_loop),
-                    "--clipboard" => self.toggle_clipboard(event_loop),
-                    "--settings" => self.open_settings(event_loop),
-                    _ => {}
-                }
+            let proxy = self.proxy.clone();
+            platform::listen_for_requests(move |request| {
+                let _ = proxy.send_event(AppEvent::Request(request));
+            });
+            // Started by hand (not at sign-in): show something so the user knows it runs.
+            let autostart = std::env::args().any(|a| a == "--autostart");
+            match platform::Request::from_args() {
+                Some(request) => self.handle_request(event_loop, request),
+                None if !autostart => self.open_settings(event_loop),
+                None => {}
             }
         }
     }
@@ -578,6 +593,7 @@ impl ApplicationHandler<AppEvent> for App {
                     self.open_editor(event_loop, image);
                 }
             }
+            AppEvent::Request(request) => self.handle_request(event_loop, request),
             AppEvent::SaveFolderPicked(path) => {
                 self.shared.settings.save_dir = path;
                 self.shared.settings.save();

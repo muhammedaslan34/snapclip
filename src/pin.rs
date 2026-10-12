@@ -4,7 +4,7 @@ use egui::{Color32, Key, Sense, Stroke, StrokeKind, TextureHandle, TextureOption
 use image::RgbaImage;
 
 use crate::app::Command;
-use crate::gl_window::{Cx, View, ViewKind};
+use crate::host::{Cx, View, ViewKind};
 use crate::theme::ACCENT;
 
 pub struct PinView {

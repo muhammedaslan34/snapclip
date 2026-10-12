@@ -8,7 +8,7 @@ use egui::{
 };
 
 use crate::app::Command;
-use crate::gl_window::{Cx, View, ViewKind};
+use crate::host::{Cx, View, ViewKind};
 use crate::history::{ClipContent, ClipItem, History};
 use crate::shortcuts::Act;
 use crate::theme::ACCENT;

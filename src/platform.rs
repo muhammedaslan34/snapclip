@@ -15,6 +15,11 @@ pub fn single_instance_lock() -> Option<File> {
     }
 }
 
+/// True if no other instance holds the lock (checked without keeping it).
+pub fn single_instance_probe() -> bool {
+    single_instance_lock().is_some()
+}
+
 /// Opaque handle of the window that had focus before one of our windows opened.
 #[derive(Clone, Copy, Debug)]
 pub struct ForeignWindow(#[allow(dead_code)] isize);
@@ -128,3 +133,126 @@ mod imp {
 }
 
 pub use imp::{activate, cursor_pos, foreground_window, scroll_at, send_paste};
+
+/// What a second launch of the app asks the running instance to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    Settings,
+    Capture,
+    Clipboard,
+}
+
+impl Request {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const ALL: [Request; 3] = [Request::Settings, Request::Capture, Request::Clipboard];
+
+    /// Reads `--capture`, `--clipboard` or `--settings` from the command line.
+    pub fn from_args() -> Option<Self> {
+        std::env::args().skip(1).find_map(|arg| match arg.as_str() {
+            "--settings" => Some(Request::Settings),
+            "--capture" => Some(Request::Capture),
+            "--clipboard" => Some(Request::Clipboard),
+            _ => None,
+        })
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn event_name(self) -> String {
+        let name = match self {
+            Request::Settings => "settings",
+            Request::Capture => "capture",
+            Request::Clipboard => "clipboard",
+        };
+        format!("Local\\SnapClip.Request.{name}")
+    }
+}
+
+#[cfg(windows)]
+mod ipc {
+    use super::Request;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, SetEvent, WaitForMultipleObjects,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW};
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    /// Waits for requests from later launches and passes them to `on_request`.
+    pub fn listen(on_request: impl Fn(Request) + Send + 'static) {
+        let handles: Vec<HANDLE> = Request::ALL
+            .iter()
+            // SAFETY: valid null-terminated name; auto-reset, initially unsignaled event.
+            .map(|r| unsafe { CreateEventW(std::ptr::null(), 0, 0, wide(&r.event_name()).as_ptr()) })
+            .collect();
+        if handles.iter().any(|h| h.is_null()) {
+            log::warn!("cannot create instance events; later launches will be ignored");
+            return;
+        }
+        // Raw handles aren't Send; they stay valid for the life of the process.
+        let raw: Vec<usize> = handles.iter().map(|h| *h as usize).collect();
+        std::thread::Builder::new()
+            .name("instance-requests".into())
+            .spawn(move || {
+                let handles: Vec<HANDLE> = raw.iter().map(|h| *h as HANDLE).collect();
+                loop {
+                    // SAFETY: `handles` holds valid event handles.
+                    let result = unsafe {
+                        WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE)
+                    };
+                    match Request::ALL.get(result.wrapping_sub(WAIT_OBJECT_0) as usize) {
+                        Some(request) => on_request(*request),
+                        None => break,
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// Signals the running instance. Returns false if none is listening.
+    pub fn send(request: Request) -> bool {
+        // SAFETY: valid null-terminated name; the handle is closed below.
+        unsafe {
+            let handle = OpenEventW(EVENT_MODIFY_STATE, 0, wide(&request.event_name()).as_ptr());
+            if handle.is_null() {
+                return false;
+            }
+            let ok = SetEvent(handle) != 0;
+            CloseHandle(handle);
+            ok
+        }
+    }
+
+    pub fn error_box(message: &str) {
+        let title = wide("SnapClip");
+        let text = wide(message);
+        // SAFETY: both strings are valid and null-terminated.
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+            )
+        };
+    }
+}
+
+#[cfg(not(windows))]
+mod ipc {
+    use super::Request;
+
+    pub fn listen(_on_request: impl Fn(Request) + Send + 'static) {}
+
+    pub fn send(_request: Request) -> bool {
+        false
+    }
+
+    pub fn error_box(message: &str) {
+        log::error!("{message}");
+    }
+}
+
+pub use ipc::{error_box, listen as listen_for_requests, send as send_request};

@@ -10,7 +10,7 @@ use egui::{
 use image::RgbaImage;
 
 use crate::app::Command;
-use crate::gl_window::{Cx, View, ViewKind};
+use crate::host::{Cx, View, ViewKind};
 use crate::scroll::{CANCEL, FINISH};
 use crate::theme::ACCENT;
 
