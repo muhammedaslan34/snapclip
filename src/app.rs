@@ -142,10 +142,17 @@ impl App {
 
     fn open(&mut self, event_loop: &ActiveEventLoop, attrs: WindowAttributes, view: Box<dyn View>) {
         match HostWindow::new(event_loop, attrs, view, &self.proxy) {
-            Ok(window) => {
+            Ok(mut window) => {
                 let id = window.window.id();
-                window.window.request_redraw();
+                // Windows never sends a redraw to a hidden window, so paint the first
+                // frame now; `redraw` makes the window visible once it has content.
+                let mut commands = Vec::new();
+                let close = window.redraw(&mut self.shared, &mut commands);
                 self.windows.insert(id, window);
+                if close {
+                    self.close(id);
+                }
+                self.run_commands(event_loop, commands);
             }
             Err(err) => {
                 log::error!("cannot open window: {err:#}");
