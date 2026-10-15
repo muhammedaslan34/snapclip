@@ -1,16 +1,17 @@
 use egui::{
     Align2, Area, Color32, Context, CursorIcon, FontId, Frame, Id, Key, KeyboardShortcut,
     Margin, Mesh, Modifiers, Order, PointerButton, Pos2, Rect, Response, RichText, Sense, Stroke,
-    StrokeKind, TextEdit, TextureHandle, TextureOptions, Vec2, pos2, vec2,
+    StrokeKind, TextEdit, TextureOptions, Vec2, pos2, vec2,
 };
 use image::RgbaImage;
 
-use super::annot::{self, Annot, Mapper, SelShape, Selection, Shape, Tool};
-use super::render;
+use super::annot::{self, Annot, Effects, Mapper, SelShape, Selection, Shape, Tool};
+use super::{render, text};
 use crate::app::Command;
 use crate::host::{Cx, View, ViewKind};
 use crate::shortcuts::Act;
 use crate::theme::ACCENT;
+use crate::tiles::TiledTexture;
 
 const PALETTE: [Color32; 10] = [
     Color32::from_rgb(239, 68, 68),
@@ -105,11 +106,30 @@ enum Drag {
     Move { grab: Pos2, orig: Rect },
     Resize { handle: Handle, grab: Pos2, orig: Rect },
     Draw(Pos2),
+    /// Moving an annotation, or resizing a text box, with the move tool.
+    EditAnnot { index: usize, grip: Grip, grab: Pos2, orig: Annot, moved: bool },
+    /// Dragging out the width of a new text box.
+    TextBox { start: Pos2, end: Pos2 },
+    /// Erasing everything the pointer passes over; `before` is kept for undo.
+    Erase { before: Vec<Annot>, last: Pos2 },
 }
+
+/// Which part of an annotation the move tool grabbed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Grip {
+    Body,
+    /// The left or right edge of a text box: changes its width.
+    Left,
+    Right,
+}
+
+const ERASER_COLOR: Color32 = Color32::from_rgb(239, 68, 68);
 
 struct TextDraft {
     pos: Pos2,
     text: String,
+    /// Wrap width in image pixels; `None` grows with the text.
+    box_width: Option<f32>,
     focused: bool,
 }
 
@@ -117,9 +137,11 @@ pub struct CaptureView {
     shot: RgbaImage,
     /// Physical desktop position of the captured monitor, used to place pinned images.
     monitor_pos: (i32, i32),
-    shot_tex: Option<TextureHandle>,
+    shot_tex: Option<TiledTexture>,
     pixelated: Option<RgbaImage>,
-    pix_tex: Option<TextureHandle>,
+    pix_tex: Option<TiledTexture>,
+    blurred: Option<RgbaImage>,
+    blur_tex: Option<TiledTexture>,
     sel_shape: SelShape,
     sel: Option<Selection>,
     drag: Drag,
@@ -129,7 +151,9 @@ pub struct CaptureView {
     font_size: f32,
     filled: bool,
     annots: Vec<Annot>,
-    redo: Vec<Annot>,
+    /// Earlier versions of `annots`, so moves and "clear all" can be undone too.
+    undo_stack: Vec<Vec<Annot>>,
+    redo_stack: Vec<Vec<Annot>>,
     current: Option<Annot>,
     draft: Option<TextDraft>,
     toolbar_size: Vec2,
@@ -150,6 +174,8 @@ impl CaptureView {
             shot_tex: None,
             pixelated: None,
             pix_tex: None,
+            blurred: None,
+            blur_tex: None,
             sel_shape: SelShape::Rect,
             sel: None,
             drag: Drag::None,
@@ -159,7 +185,8 @@ impl CaptureView {
             font_size: settings.font_size.clamp(10.0, 120.0),
             filled: false,
             annots: Vec::new(),
-            redo: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             current: None,
             draft: None,
             toolbar_size: vec2(640.0, 84.0),
@@ -200,8 +227,6 @@ impl CaptureView {
 
     fn ensure_textures(&mut self, ctx: &Context) {
         if self.shot_tex.is_none() {
-            let size = [self.shot.width() as usize, self.shot.height() as usize];
-            let image = egui::ColorImage::from_rgba_unmultiplied(size, self.shot.as_raw());
             // NEAREST keeps the 1:1 overlay crisp and the magnifier pixel-exact;
             // the editor scales the image, where LINEAR looks better.
             let options = if self.editor {
@@ -209,7 +234,7 @@ impl CaptureView {
             } else {
                 TextureOptions::NEAREST
             };
-            self.shot_tex = Some(ctx.load_texture("screenshot", image, options));
+            self.shot_tex = Some(TiledTexture::new(ctx, "screenshot", &self.shot, options));
         }
     }
 
@@ -219,9 +244,23 @@ impl CaptureView {
             self.pixelated = Some(render::pixelate(&self.shot, block));
         }
         if let (Some(ctx), None, Some(pix)) = (ctx, &self.pix_tex, &self.pixelated) {
-            let size = [pix.width() as usize, pix.height() as usize];
-            let image = egui::ColorImage::from_rgba_unmultiplied(size, pix.as_raw());
-            self.pix_tex = Some(ctx.load_texture("pixelated", image, TextureOptions::NEAREST));
+            self.pix_tex = Some(TiledTexture::new(ctx, "pixelated", pix, TextureOptions::NEAREST));
+        }
+    }
+
+    fn ensure_blurred(&mut self, ctx: Option<&Context>) {
+        if self.blurred.is_none() {
+            self.blurred = Some(render::blur(&self.shot));
+        }
+        if let (Some(ctx), None, Some(blurred)) = (ctx, &self.blur_tex, &self.blurred) {
+            self.blur_tex = Some(TiledTexture::new(ctx, "blurred", blurred, TextureOptions::LINEAR));
+        }
+    }
+
+    fn effect_textures(&self) -> Effects<&TiledTexture> {
+        Effects {
+            pixelated: self.pix_tex.as_ref(),
+            blurred: self.blur_tex.as_ref(),
         }
     }
 
@@ -235,17 +274,33 @@ impl CaptureView {
         }
     }
 
+    /// Remembers the current annotations for undo. Call before changing them.
+    fn checkpoint(&mut self) {
+        self.undo_stack.push(self.annots.clone());
+        self.redo_stack.clear();
+    }
+
     fn push_annot(&mut self, annot: Annot) {
         if !annot.is_degenerate() {
+            self.checkpoint();
             self.annots.push(annot);
-            self.redo.clear();
+        }
+    }
+
+    fn clear_all(&mut self) {
+        self.commit_draft();
+        if !self.annots.is_empty() {
+            self.checkpoint();
+            self.annots.clear();
         }
     }
 
     fn set_tool(&mut self, tool: Tool, ctx: &Context) {
         self.commit_draft();
-        if tool == Tool::Pixelate {
-            self.ensure_pixelated(Some(ctx));
+        match tool {
+            Tool::Pixelate => self.ensure_pixelated(Some(ctx)),
+            Tool::Blur => self.ensure_blurred(Some(ctx)),
+            _ => {}
         }
         self.tool = tool;
     }
@@ -256,21 +311,62 @@ impl CaptureView {
             self.push_annot(self.new_annot(Shape::Text {
                 pos: draft.pos,
                 text,
+                box_width: draft.box_width,
             }));
         }
     }
 
     fn undo(&mut self) {
         self.commit_draft();
-        if let Some(a) = self.annots.pop() {
-            self.redo.push(a);
+        if let Some(previous) = self.undo_stack.pop() {
+            self.redo_stack.push(std::mem::replace(&mut self.annots, previous));
         }
     }
 
     fn redo(&mut self) {
-        if let Some(a) = self.redo.pop() {
-            self.annots.push(a);
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(std::mem::replace(&mut self.annots, next));
         }
+    }
+
+    /// Index of the topmost annotation under `p` (image pixels).
+    fn annot_at(&self, p: Pos2, map: &Mapper) -> Option<usize> {
+        let tolerance = 5.0 * map.ppp;
+        self.annots.iter().rposition(|a| a.hit(p, tolerance))
+    }
+
+    /// The annotation under `p` and the part of it the move tool would grab.
+    fn grip_at(&self, p: Pos2, map: &Mapper) -> Option<(usize, Grip)> {
+        let index = self.annot_at(p, map)?;
+        let annot = &self.annots[index];
+        let mut grip = Grip::Body;
+        if matches!(annot.shape, Shape::Text { .. }) {
+            let b = annot.bounds();
+            let reach = 6.0 * map.ppp;
+            if (b.min.y - reach..=b.max.y + reach).contains(&p.y) {
+                if (p.x - b.max.x).abs() <= reach {
+                    grip = Grip::Right;
+                } else if (p.x - b.min.x).abs() <= reach {
+                    grip = Grip::Left;
+                }
+            }
+        }
+        Some((index, grip))
+    }
+
+    /// Deletes the annotations touched along the segment `from`→`to`. Returns whether any were.
+    fn erase_along(&mut self, from: Pos2, to: Pos2, map: &Mapper) -> bool {
+        let step = 4.0 * map.ppp;
+        let n = (from.distance(to) / step).ceil().max(1.0) as usize;
+        let mut erased = false;
+        for i in 0..=n {
+            let p = from.lerp(to, i as f32 / n as f32);
+            while let Some(index) = self.annot_at(p, map) {
+                self.annots.remove(index);
+                erased = true;
+            }
+        }
+        erased
     }
 
     /// The editor has no selection to adjust, so it leaves that tool out.
@@ -305,16 +401,18 @@ impl CaptureView {
 
     fn finish(&mut self, action: Action, cx: &mut Cx<'_>) {
         self.commit_draft();
-        if self
-            .annots
-            .iter()
-            .any(|a| matches!(a.shape, Shape::Pixelate(_)))
-        {
+        if self.annots.iter().any(|a| matches!(a.shape, Shape::Pixelate(_))) {
             self.ensure_pixelated(None);
         }
+        if self.annots.iter().any(|a| matches!(a.shape, Shape::Blur(_))) {
+            self.ensure_blurred(None);
+        }
         let Some(sel) = &self.sel else { return };
-        let Some(image) = render::export(&self.shot, self.pixelated.as_ref(), sel, &self.annots)
-        else {
+        let effects = Effects {
+            pixelated: self.pixelated.as_ref(),
+            blurred: self.blurred.as_ref(),
+        };
+        let Some(image) = render::export(&self.shot, effects, sel, &self.annots) else {
             return;
         };
         let origin = (
@@ -395,13 +493,13 @@ impl CaptureView {
             self.begin_drag(origin, self.clamp_img(map.to_img(origin)), map);
         }
         if resp.dragged_by(PointerButton::Primary) {
-            self.update_drag(p, raw_img, shift);
+            self.update_drag(p, raw_img, shift, map);
         }
         if resp.drag_stopped_by(PointerButton::Primary) {
             self.end_drag();
         }
         if resp.clicked_by(PointerButton::Primary) {
-            self.click(p);
+            self.click(p, map);
         }
         if resp.secondary_clicked() {
             if self.draft.is_some() || self.editor {
@@ -418,7 +516,10 @@ impl CaptureView {
 
     fn cursor_for(&self, screen_pos: Pos2, img_pos: Pos2, map: &Mapper) -> CursorIcon {
         match &self.drag {
-            Drag::Move { .. } => return CursorIcon::Grabbing,
+            Drag::Move { .. } | Drag::EditAnnot { grip: Grip::Body, .. } => return CursorIcon::Grabbing,
+            Drag::EditAnnot { .. } => return CursorIcon::ResizeHorizontal,
+            Drag::TextBox { .. } => return CursorIcon::Text,
+            Drag::Erase { .. } => return CursorIcon::Crosshair,
             Drag::Resize { handle, .. } => return handle.cursor(),
             Drag::NewSel(_) | Drag::Free(_) | Drag::Draw(_) => return CursorIcon::Crosshair,
             Drag::None => {}
@@ -434,6 +535,18 @@ impl CaptureView {
                     CursorIcon::Move
                 } else {
                     CursorIcon::Default
+                }
+            }
+            Tool::Move => match self.grip_at(img_pos, map) {
+                Some((_, Grip::Body)) => CursorIcon::Grab,
+                Some(_) => CursorIcon::ResizeHorizontal,
+                None => CursorIcon::Default,
+            },
+            Tool::Eraser => {
+                if self.annot_at(img_pos, map).is_some() {
+                    CursorIcon::PointingHand
+                } else {
+                    CursorIcon::Crosshair
                 }
             }
             Tool::Text => CursorIcon::Text,
@@ -466,7 +579,26 @@ impl CaptureView {
                     Drag::None
                 }
             }
-            (Some(_), Tool::Text | Tool::Step) => Drag::None,
+            (Some(_), Tool::Move) => match self.grip_at(origin, map) {
+                Some((index, grip)) => Drag::EditAnnot {
+                    index,
+                    grip,
+                    grab: origin,
+                    orig: self.annots[index].clone(),
+                    moved: false,
+                },
+                None => Drag::None,
+            },
+            (Some(_), Tool::Eraser) => {
+                let before = self.annots.clone();
+                self.erase_along(origin, origin, map);
+                Drag::Erase { before, last: origin }
+            }
+            (Some(_), Tool::Text) => Drag::TextBox {
+                start: origin,
+                end: origin,
+            },
+            (Some(_), Tool::Step) => Drag::None,
             (Some(_), tool) => {
                 let shape = match tool {
                     Tool::Pen => Shape::Pen(vec![origin]),
@@ -475,6 +607,7 @@ impl CaptureView {
                     Tool::Arrow => Shape::Arrow(origin, origin),
                     Tool::Rect => Shape::Rect(Rect::from_two_pos(origin, origin)),
                     Tool::Ellipse => Shape::Ellipse(Rect::from_two_pos(origin, origin)),
+                    Tool::Blur => Shape::Blur(Rect::from_two_pos(origin, origin)),
                     _ => Shape::Pixelate(Rect::from_two_pos(origin, origin)),
                 };
                 self.current = Some(self.new_annot(shape));
@@ -483,9 +616,16 @@ impl CaptureView {
         };
     }
 
-    fn update_drag(&mut self, p: Pos2, raw: Pos2, shift: bool) {
+    fn update_drag(&mut self, p: Pos2, raw: Pos2, shift: bool, map: &Mapper) {
+        if let Drag::Erase { last, .. } = &mut self.drag {
+            let from = std::mem::replace(last, p);
+            self.erase_along(from, p, map);
+            return;
+        }
         let bounds = self.img_rect();
         match &mut self.drag {
+            Drag::Erase { .. } => {}
+            Drag::TextBox { end, .. } => *end = p,
             Drag::None => {}
             Drag::NewSel(start) => {
                 let end = if shift { annot::square(*start, p) } else { p };
@@ -544,12 +684,44 @@ impl CaptureView {
                     Shape::Line(_, b) | Shape::Arrow(_, b) => {
                         *b = if shift { annot::snap_angle(start, p) } else { p };
                     }
-                    Shape::Rect(r) | Shape::Ellipse(r) | Shape::Pixelate(r) => {
+                    Shape::Rect(r) | Shape::Ellipse(r) | Shape::Pixelate(r) | Shape::Blur(r) => {
                         let end = if shift { annot::square(start, p) } else { p };
                         *r = Rect::from_two_pos(start, end);
                     }
                     Shape::Text { .. } | Shape::Step { .. } => {}
                 }
+            }
+            Drag::EditAnnot {
+                index,
+                grip,
+                grab,
+                orig,
+                moved,
+            } => {
+                let delta = raw - *grab;
+                if delta != Vec2::ZERO {
+                    *moved = true;
+                }
+                let mut annot = orig.clone();
+                match grip {
+                    Grip::Body => annot.translate(delta),
+                    Grip::Left | Grip::Right => {
+                        let b = orig.bounds();
+                        let min_width = orig.font_size;
+                        let new_width = match grip {
+                            Grip::Right => b.width() + delta.x,
+                            _ => b.width() - delta.x,
+                        }
+                        .max(min_width);
+                        if let Shape::Text { pos, box_width, .. } = &mut annot.shape {
+                            if *grip == Grip::Left {
+                                pos.x = b.max.x - new_width;
+                            }
+                            *box_width = Some(new_width);
+                        }
+                    }
+                }
+                self.annots[*index] = annot;
             }
         }
     }
@@ -571,11 +743,40 @@ impl CaptureView {
                     self.push_annot(annot);
                 }
             }
-            Drag::None | Drag::Move { .. } | Drag::Resize { .. } => {}
+            Drag::EditAnnot {
+                index,
+                orig,
+                moved: true,
+                ..
+            } => {
+                let mut before = self.annots.clone();
+                before[index] = orig;
+                self.undo_stack.push(before);
+                self.redo_stack.clear();
+            }
+            Drag::Erase { before, .. } => {
+                if before.len() != self.annots.len() {
+                    self.undo_stack.push(before);
+                    self.redo_stack.clear();
+                }
+            }
+            Drag::TextBox { start, end } => {
+                self.commit_draft();
+                // A short drag is treated like a click: the text grows as you type.
+                let width = (end.x - start.x).abs();
+                let box_width = (width >= 12.0).then_some(width);
+                self.draft = Some(TextDraft {
+                    pos: pos2(start.x.min(end.x), start.y.min(end.y)),
+                    text: String::new(),
+                    box_width,
+                    focused: false,
+                });
+            }
+            Drag::None | Drag::Move { .. } | Drag::Resize { .. } | Drag::EditAnnot { .. } => {}
         }
     }
 
-    fn click(&mut self, p: Pos2) {
+    fn click(&mut self, p: Pos2, map: &Mapper) {
         if self.sel.is_none() {
             self.select_all();
             return;
@@ -586,8 +787,15 @@ impl CaptureView {
                 self.draft = Some(TextDraft {
                     pos: p,
                     text: String::new(),
+                    box_width: None,
                     focused: false,
                 });
+            }
+            Tool::Eraser => {
+                if let Some(index) = self.annot_at(p, map) {
+                    self.checkpoint();
+                    self.annots.remove(index);
+                }
             }
             Tool::Step => {
                 let number = self
@@ -607,7 +815,12 @@ impl CaptureView {
             if self.draft.is_some() {
                 self.commit_draft();
             } else if !matches!(self.drag, Drag::None) {
-                self.drag = Drag::None;
+                // Esc undoes the move, resize or erase in progress.
+                match std::mem::replace(&mut self.drag, Drag::None) {
+                    Drag::EditAnnot { index, orig, .. } => self.annots[index] = orig,
+                    Drag::Erase { before, .. } => self.annots = before,
+                    _ => {}
+                }
                 self.current = None;
                 if self.sel.as_ref().is_some_and(|s| s.rect.area() < 9.0) {
                     self.sel = None;
@@ -641,6 +854,9 @@ impl CaptureView {
         }
         if keys.pressed(ctx, Act::Undo) {
             self.undo();
+        }
+        if keys.pressed(ctx, Act::ClearAll) {
+            self.clear_all();
         }
         for (act, action) in [
             (Act::SaveAs, Action::SaveAs),
@@ -692,8 +908,7 @@ impl CaptureView {
     fn paint_scene(&self, painter: &egui::Painter, map: &Mapper, screen: Rect) {
         let Some(tex) = &self.shot_tex else { return };
         let img_size = self.img_size();
-        let full_uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-        painter.image(tex.id(), map.rect(self.img_rect()), full_uv, Color32::WHITE);
+        tex.paint(painter, self.img_rect(), map.rect(self.img_rect()), Color32::WHITE);
         painter.rect_filled(screen, 0.0, DIM);
 
         if let Drag::Free(points) = &self.drag {
@@ -707,24 +922,17 @@ impl CaptureView {
 
         // Un-dim the selected area.
         match sel.shape {
-            SelShape::Rect => {
-                let uv = Rect::from_min_max(
-                    (sel.rect.min.to_vec2() / img_size).to_pos2(),
-                    (sel.rect.max.to_vec2() / img_size).to_pos2(),
-                );
-                painter.image(tex.id(), sel_screen, uv, Color32::WHITE);
-            }
+            SelShape::Rect => tex.paint(painter, sel.rect, sel_screen, Color32::WHITE),
             _ => {
-                if let Some(mesh) = textured_polygon(&polygon, tex.id(), img_size, map) {
+                if let Some(mesh) = tex.single().and_then(|id| textured_polygon(&polygon, id, img_size, map)) {
                     painter.add(mesh);
                 }
             }
         }
 
         let clipped = painter.with_clip_rect(sel_screen.intersect(screen));
-        let pix = self.pix_tex.as_ref().map(|t| t.id());
         for a in self.annots.iter().chain(self.current.as_ref()) {
-            annot::paint(&clipped, a, map, pix, img_size);
+            annot::paint(&clipped, a, map, self.effect_textures());
         }
 
         // Outline.
@@ -766,9 +974,49 @@ impl CaptureView {
         painter.galley(pos + vec2(5.0, 2.0), galley, Color32::WHITE);
     }
 
+    /// Feedback for the move, eraser and text tools: what they would act on.
+    fn paint_tool_hints(&self, painter: &egui::Painter, map: &Mapper, pointer: Option<Pos2>) {
+        let hovered = || pointer.and_then(|p| self.annot_at(map.to_img(p), map));
+        match self.tool {
+            Tool::Move => {
+                let index = match &self.drag {
+                    Drag::EditAnnot { index, .. } => Some(*index),
+                    _ => hovered(),
+                };
+                let Some(a) = index.and_then(|i| self.annots.get(i)) else {
+                    return;
+                };
+                let r = map.rect(a.bounds()).expand(4.0);
+                painter.rect_stroke(r, 2.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
+                if matches!(a.shape, Shape::Text { .. }) {
+                    // Handles on both sides: drag them to change the box width.
+                    for x in [r.left(), r.right()] {
+                        let h = Rect::from_center_size(pos2(x, r.center().y), vec2(HANDLE * 1.6, HANDLE * 3.6));
+                        painter.rect_filled(h, 2.0, Color32::WHITE);
+                        painter.rect_stroke(h, 2.0, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
+                    }
+                }
+            }
+            Tool::Eraser if !matches!(self.drag, Drag::Erase { .. }) => {
+                if let Some(a) = hovered().and_then(|i| self.annots.get(i)) {
+                    let r = map.rect(a.bounds()).expand(4.0);
+                    painter.rect_stroke(r, 2.0, Stroke::new(1.5, ERASER_COLOR), StrokeKind::Outside);
+                }
+            }
+            Tool::Text => {
+                if let Drag::TextBox { start, end } = &self.drag {
+                    let height = text::glyph_height(self.font_size).max((end.y - start.y).abs());
+                    let top_left = pos2(start.x.min(end.x), start.y.min(end.y));
+                    let r = Rect::from_min_size(top_left, vec2((end.x - start.x).abs(), height));
+                    painter.rect_stroke(map.rect(r), 2.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn paint_magnifier(&self, painter: &egui::Painter, pointer: Pos2, map: &Mapper, screen: Rect) {
         let Some(tex) = &self.shot_tex else { return };
-        let img_size = self.img_size();
         let p = map.to_img(pointer).floor();
         if !self.img_rect().contains(p) {
             return;
@@ -791,12 +1039,11 @@ impl CaptureView {
         let zoom_rect = Rect::from_min_size(pos, Vec2::splat(MAGNIFIER_SIZE));
         let half = MAGNIFIER_SIZE / MAGNIFIER_ZOOM / 2.0;
         let center = p + vec2(0.5, 0.5);
-        let uv = Rect::from_min_max(
-            ((center - Vec2::splat(half)).to_vec2() / img_size).to_pos2(),
-            ((center + Vec2::splat(half)).to_vec2() / img_size).to_pos2(),
-        );
         painter.rect_filled(zoom_rect, 0.0, Color32::BLACK);
-        painter.image(tex.id(), zoom_rect, uv, Color32::WHITE);
+        let src = Rect::from_center_size(center, Vec2::splat(half * 2.0));
+        let visible = src.intersect(self.img_rect());
+        let to_zoom = |p: Pos2| zoom_rect.min + (p - src.min) * MAGNIFIER_ZOOM;
+        tex.paint(painter, visible, Rect::from_min_max(to_zoom(visible.min), to_zoom(visible.max)), Color32::WHITE);
         let cell = MAGNIFIER_ZOOM;
         let c = zoom_rect.center();
         painter.rect_stroke(
@@ -899,9 +1146,21 @@ impl CaptureView {
         let keys = cx.shared.settings.keymap.clone();
         let big = |s: &str| RichText::new(s).size(17.0);
         ui.horizontal(|ui| {
+            let mut button_size = Vec2::ZERO;
             for tool in self.tools() {
-                if ui
-                    .selectable_label(self.tool == tool, big(tool.icon()))
+                let selected = self.tool == tool;
+                let button = egui::Button::selectable(selected, big(tool.icon())).min_size(button_size);
+                let resp = ui.add(button);
+                if tool == Tool::Eraser {
+                    let color = if selected {
+                        ui.visuals().selection.stroke.color
+                    } else {
+                        ui.visuals().widgets.style(&resp).fg_stroke.color
+                    };
+                    paint_eraser_icon(ui.painter(), resp.rect, color);
+                }
+                button_size = resp.rect.size();
+                if resp
                     .on_hover_text(format!("{}{}", tool.label(), cx.shared.settings.keymap.hint(tool.act())))
                     .clicked()
                 {
@@ -910,18 +1169,25 @@ impl CaptureView {
             }
             ui.separator();
             if ui
-                .add_enabled(!self.annots.is_empty() || self.draft.is_some(), egui::Button::new(big("⟲")))
+                .add_enabled(!self.undo_stack.is_empty() || self.draft.is_some(), egui::Button::new(big("⟲")))
                 .on_hover_text(format!("Undo{}", keys.hint(Act::Undo)))
                 .clicked()
             {
                 self.undo();
             }
             if ui
-                .add_enabled(!self.redo.is_empty(), egui::Button::new(big("⟳")))
+                .add_enabled(!self.redo_stack.is_empty(), egui::Button::new(big("⟳")))
                 .on_hover_text(format!("Redo{}", keys.hint(Act::Redo)))
                 .clicked()
             {
                 self.redo();
+            }
+            if ui
+                .add_enabled(!self.annots.is_empty() || self.draft.is_some(), egui::Button::new(big("🗑")))
+                .on_hover_text(format!("Clear all annotations{} (can be undone)", keys.hint(Act::ClearAll)))
+                .clicked()
+            {
+                self.clear_all();
             }
             ui.separator();
             if !self.editor
@@ -1052,15 +1318,14 @@ impl CaptureView {
                         self.handle_pointer(&ctx, &response, &map, cx);
 
                         let painter = ui.painter();
-                        let full_uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
                         if let Some(tex) = &self.shot_tex {
-                            painter.image(tex.id(), image_rect, full_uv, Color32::WHITE);
+                            tex.paint(painter, self.img_rect(), image_rect, Color32::WHITE);
                         }
                         let clipped = painter.with_clip_rect(image_rect.intersect(painter.clip_rect()));
-                        let pix = self.pix_tex.as_ref().map(|t| t.id());
                         for a in self.annots.iter().chain(self.current.as_ref()) {
-                            annot::paint(&clipped, a, &map, pix, img);
+                            annot::paint(&clipped, a, &map, self.effect_textures());
                         }
+                        self.paint_tool_hints(painter, &map, response.hover_pos());
                         painter.rect_stroke(
                             image_rect,
                             0.0,
@@ -1077,22 +1342,41 @@ impl CaptureView {
         let color = self.color;
         let Some(draft) = &mut self.draft else { return };
         let pos = map.to_screen(draft.pos);
-        let width = ctx
-            .fonts_mut(|f| f.layout_no_wrap(format!("{}W", draft.text), font.clone(), color))
-            .size()
-            .x;
+        let wrap = draft.box_width.map(|w| map.len(w));
+        let width = wrap.unwrap_or_else(|| {
+            let shown: Vec<String> = draft.text.split('\n').map(text::visual_same_length).collect();
+            ctx.fonts_mut(|f| f.layout_no_wrap(format!("{}W", shown.join("\n")), font.clone(), color))
+                .size()
+                .x
+                .max(20.0)
+        });
+        // Wrap only at the box width (or never): the area's own width lags a frame
+        // behind the text and would otherwise break lines after every few letters.
+        // Arabic is shown joined and right-to-left while typing, as it will be drawn.
+        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _: f32| {
+            let shown: Vec<String> = buf.as_str().split('\n').map(text::visual_same_length).collect();
+            let job = egui::text::LayoutJob::simple(
+                shown.join("\n"),
+                font.clone(),
+                color,
+                wrap.unwrap_or(f32::INFINITY),
+            );
+            ui.ctx().fonts_mut(|f| f.layout_job(job))
+        };
         let inner = Area::new(Id::new("text_draft"))
             .order(Order::Foreground)
             .fixed_pos(pos)
             .show(ctx, |ui| {
+                ui.set_min_width(width);
                 ui.add(
                     TextEdit::multiline(&mut draft.text)
-                        .font(font)
+                        .font(font.clone())
                         .text_color(color)
                         .frame(Frame::NONE)
                         .margin(Margin::ZERO)
                         .desired_rows(1)
-                        .desired_width(width.max(20.0)),
+                        .desired_width(width)
+                        .layouter(&mut layouter),
                 )
             })
             .inner;
@@ -1141,6 +1425,7 @@ impl View for CaptureView {
 
         let painter = ui.painter().clone();
         self.paint_scene(&painter, &map, screen);
+        self.paint_tool_hints(&painter, &map, response.hover_pos());
 
         if self.editing() {
             self.text_draft_ui(&ctx, &map);
@@ -1160,6 +1445,18 @@ impl View for CaptureView {
             }
         }
     }
+}
+
+/// A tilted eraser, since egui's fonts have no eraser symbol.
+fn paint_eraser_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let along = Vec2::angled(-0.75);
+    let across = along.rot90();
+    let corner = |a: f32, b: f32| c + along * a + across * b;
+    let tip = vec![corner(-8.0, -4.5), corner(-1.5, -4.5), corner(-1.5, 4.5), corner(-8.0, 4.5)];
+    let body = vec![corner(-8.0, -4.5), corner(8.0, -4.5), corner(8.0, 4.5), corner(-8.0, 4.5)];
+    painter.add(egui::Shape::convex_polygon(tip, color, Stroke::NONE));
+    painter.add(egui::Shape::closed_line(body, Stroke::new(1.5, color)));
 }
 
 fn round_rect(r: Rect) -> Rect {
@@ -1192,4 +1489,96 @@ fn textured_polygon(
     }
     mesh.indices = indices;
     Some(mesh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAP: Mapper = Mapper { origin: Pos2::ZERO, ppp: 1.0 };
+
+    fn view() -> CaptureView {
+        let shot = RgbaImage::new(200, 100);
+        CaptureView::editor(shot, &crate::settings::Settings::default())
+    }
+
+    fn line(view: &CaptureView, x: f32) -> Annot {
+        view.new_annot(Shape::Line(pos2(x, 10.0), pos2(x, 90.0)))
+    }
+
+    #[test]
+    fn clear_all_and_move_can_be_undone() {
+        let mut v = view();
+        v.push_annot(line(&v, 10.0));
+        v.push_annot(line(&v, 50.0));
+
+        v.clear_all();
+        assert!(v.annots.is_empty());
+        v.undo();
+        assert_eq!(v.annots.len(), 2);
+        v.redo();
+        assert!(v.annots.is_empty());
+        v.undo();
+
+        // Drag the second line 30 px to the right.
+        v.drag = Drag::EditAnnot {
+            index: 1,
+            grip: Grip::Body,
+            grab: pos2(50.0, 50.0),
+            orig: v.annots[1].clone(),
+            moved: false,
+        };
+        v.update_drag(pos2(80.0, 50.0), pos2(80.0, 50.0), false, &MAP);
+        v.end_drag();
+        assert!(matches!(v.annots[1].shape, Shape::Line(a, _) if a.x == 80.0));
+        v.undo();
+        assert!(matches!(v.annots[1].shape, Shape::Line(a, _) if a.x == 50.0));
+    }
+
+    #[test]
+    fn eraser_drag_deletes_what_it_crosses_in_one_undo_step() {
+        let mut v = view();
+        for x in [20.0, 60.0, 150.0] {
+            v.push_annot(line(&v, x));
+        }
+        v.tool = Tool::Eraser;
+        v.begin_drag(Pos2::ZERO, pos2(10.0, 50.0), &MAP);
+        v.update_drag(pos2(100.0, 50.0), pos2(100.0, 50.0), false, &MAP);
+        v.end_drag();
+        assert_eq!(v.annots.len(), 1, "the lines at x=20 and x=60 are erased");
+        v.undo();
+        assert_eq!(v.annots.len(), 3);
+    }
+
+    #[test]
+    fn dragging_a_text_edge_sets_its_box_width() {
+        let mut v = view();
+        v.push_annot(v.new_annot(Shape::Text { pos: pos2(10.0, 10.0), text: "hello world".into(), box_width: None }));
+        let b = v.annots[0].bounds();
+        v.tool = Tool::Move;
+        let edge = pos2(b.max.x, b.center().y);
+        assert!(matches!(v.grip_at(edge, &MAP), Some((0, Grip::Right))));
+        v.begin_drag(Pos2::ZERO, edge, &MAP);
+        let target = pos2(b.max.x - 30.0, edge.y);
+        v.update_drag(target, target, false, &MAP);
+        v.end_drag();
+        let Shape::Text { pos, box_width, .. } = &v.annots[0].shape else { unreachable!() };
+        assert_eq!(*pos, pos2(10.0, 10.0));
+        assert_eq!(*box_width, Some(b.width() - 30.0));
+    }
+
+    #[test]
+    fn a_click_without_movement_adds_no_undo_step() {
+        let mut v = view();
+        v.push_annot(line(&v, 10.0));
+        v.drag = Drag::EditAnnot {
+            index: 0,
+            grip: Grip::Body,
+            grab: pos2(10.0, 50.0),
+            orig: v.annots[0].clone(),
+            moved: false,
+        };
+        v.end_drag();
+        assert_eq!(v.undo_stack.len(), 1);
+    }
 }

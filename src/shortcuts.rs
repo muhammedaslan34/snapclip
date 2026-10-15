@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum Act {
     ToolAdjust,
+    ToolMove,
     ToolPen,
     ToolMarker,
     ToolLine,
@@ -19,6 +20,8 @@ pub enum Act {
     ToolText,
     ToolStep,
     ToolPixelate,
+    ToolBlur,
+    ToolEraser,
     Copy,
     Save,
     SaveAs,
@@ -26,6 +29,7 @@ pub enum Act {
     ScrollCapture,
     Undo,
     Redo,
+    ClearAll,
     SelectAll,
     ClipPaste,
     ClipDelete,
@@ -53,8 +57,9 @@ impl Group {
 }
 
 impl Act {
-    pub const ALL: [Act; 22] = [
+    pub const ALL: [Act; 26] = [
         Act::ToolAdjust,
+        Act::ToolMove,
         Act::ToolPen,
         Act::ToolMarker,
         Act::ToolLine,
@@ -64,6 +69,8 @@ impl Act {
         Act::ToolText,
         Act::ToolStep,
         Act::ToolPixelate,
+        Act::ToolBlur,
+        Act::ToolEraser,
         Act::Copy,
         Act::Save,
         Act::SaveAs,
@@ -71,6 +78,7 @@ impl Act {
         Act::ScrollCapture,
         Act::Undo,
         Act::Redo,
+        Act::ClearAll,
         Act::SelectAll,
         Act::ClipPaste,
         Act::ClipDelete,
@@ -81,6 +89,7 @@ impl Act {
     pub fn label(self) -> &'static str {
         match self {
             Act::ToolAdjust => "Move / resize selection",
+            Act::ToolMove => "Move annotations",
             Act::ToolPen => "Pen",
             Act::ToolMarker => "Highlighter",
             Act::ToolLine => "Line",
@@ -90,6 +99,8 @@ impl Act {
             Act::ToolText => "Text",
             Act::ToolStep => "Numbered step",
             Act::ToolPixelate => "Pixelate",
+            Act::ToolBlur => "Blur",
+            Act::ToolEraser => "Eraser",
             Act::Copy => "Copy to clipboard",
             Act::Save => "Save to folder",
             Act::SaveAs => "Save as…",
@@ -97,6 +108,7 @@ impl Act {
             Act::ScrollCapture => "Scrolling capture",
             Act::Undo => "Undo",
             Act::Redo => "Redo",
+            Act::ClearAll => "Clear all annotations",
             Act::SelectAll => "Select full screen",
             Act::ClipPaste => "Paste selected item",
             Act::ClipDelete => "Delete selected item",
@@ -108,6 +120,7 @@ impl Act {
     pub fn group(self) -> Group {
         match self {
             Act::ToolAdjust
+            | Act::ToolMove
             | Act::ToolPen
             | Act::ToolMarker
             | Act::ToolLine
@@ -116,7 +129,9 @@ impl Act {
             | Act::ToolEllipse
             | Act::ToolText
             | Act::ToolStep
-            | Act::ToolPixelate => Group::Tools,
+            | Act::ToolPixelate
+            | Act::ToolBlur
+            | Act::ToolEraser => Group::Tools,
             Act::ClipPaste | Act::ClipDelete | Act::ClipPin | Act::ClipEdit => Group::Clipboard,
             _ => Group::Editor,
         }
@@ -125,6 +140,7 @@ impl Act {
     pub fn default_keys(self) -> &'static str {
         match self {
             Act::ToolAdjust => "V",
+            Act::ToolMove => "H",
             Act::ToolPen => "P",
             Act::ToolMarker => "M",
             Act::ToolLine => "L",
@@ -134,6 +150,8 @@ impl Act {
             Act::ToolText => "T",
             Act::ToolStep => "N",
             Act::ToolPixelate => "B",
+            Act::ToolBlur => "U",
+            Act::ToolEraser => "X",
             Act::Copy => "Enter, Ctrl+C",
             Act::Save => "Ctrl+S",
             Act::SaveAs => "Ctrl+Shift+S",
@@ -141,6 +159,7 @@ impl Act {
             Act::ScrollCapture => "Ctrl+L",
             Act::Undo => "Ctrl+Z",
             Act::Redo => "Ctrl+Y, Ctrl+Shift+Z",
+            Act::ClearAll => "Ctrl+Delete",
             Act::SelectAll => "Ctrl+A",
             Act::ClipPaste => "Enter",
             Act::ClipDelete => "Shift+Delete",

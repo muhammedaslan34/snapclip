@@ -98,6 +98,17 @@ mod imp {
         send(&[wheel]);
     }
 
+    /// Keeps `window` out of screenshots, so it never ends up in its own capture.
+    pub fn exclude_from_capture(window: &winit::window::Window) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = window.window_handle() else { return };
+        if let RawWindowHandle::Win32(h) = handle.as_raw() {
+            // SAFETY: the handle belongs to a live window of this process.
+            unsafe { SetWindowDisplayAffinity(h.hwnd.get() as _, WDA_EXCLUDEFROMCAPTURE) };
+        }
+    }
+
     fn send(inputs: &[INPUT]) {
         // SAFETY: `inputs` is a valid slice of INPUT structs of the given size.
         unsafe {
@@ -130,9 +141,11 @@ mod imp {
 
     /// Automatic scrolling is Windows-only; elsewhere the user scrolls by hand.
     pub fn scroll_at(_pos: (i32, i32), _notches: i32) {}
+
+    pub fn exclude_from_capture(_window: &winit::window::Window) {}
 }
 
-pub use imp::{activate, cursor_pos, foreground_window, scroll_at, send_paste};
+pub use imp::{activate, cursor_pos, exclude_from_capture, foreground_window, scroll_at, send_paste};
 
 /// What a second launch of the app asks the running instance to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

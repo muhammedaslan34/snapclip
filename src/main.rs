@@ -16,6 +16,7 @@ mod settings;
 mod settings_view;
 mod shortcuts;
 mod theme;
+mod tiles;
 mod toast;
 mod tray;
 

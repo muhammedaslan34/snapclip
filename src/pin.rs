@@ -1,15 +1,16 @@
 //! A screenshot pinned on top of all windows.
 
-use egui::{Color32, Key, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, ViewportCommand, vec2};
+use egui::{Color32, Key, Sense, Stroke, StrokeKind, TextureOptions, ViewportCommand, vec2};
 use image::RgbaImage;
 
 use crate::app::Command;
 use crate::host::{Cx, View, ViewKind};
 use crate::theme::ACCENT;
+use crate::tiles::TiledTexture;
 
 pub struct PinView {
     image: RgbaImage,
-    tex: Option<TextureHandle>,
+    tex: Option<TiledTexture>,
     zoom: f32,
 }
 
@@ -30,24 +31,19 @@ impl View for PinView {
 
     fn ui(&mut self, ui: &mut egui::Ui, cx: &mut Cx<'_>) {
         let ctx = ui.ctx().clone();
+        let image = &self.image;
         let tex = self
             .tex
-            .get_or_insert_with(|| {
-                let size = [self.image.width() as usize, self.image.height() as usize];
-                let img = egui::ColorImage::from_rgba_unmultiplied(size, self.image.as_raw());
-                ctx.load_texture("pin", img, TextureOptions::LINEAR)
-            })
-            .clone();
+            .get_or_insert_with(|| TiledTexture::new(&ctx, "pin", image, TextureOptions::LINEAR));
+        let image_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            vec2(self.image.width() as f32, self.image.height() as f32),
+        );
 
         let rect = ctx.content_rect();
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         ui.painter().rect_filled(rect, 0.0, Color32::from_gray(40));
-        ui.painter().image(
-            tex.id(),
-            rect,
-            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        tex.paint(ui.painter(), image_rect, rect, Color32::WHITE);
         let border = if response.hovered() { ACCENT } else { Color32::from_gray(90) };
         ui.painter()
             .rect_stroke(rect, 0.0, Stroke::new(1.0, border), StrokeKind::Inside);

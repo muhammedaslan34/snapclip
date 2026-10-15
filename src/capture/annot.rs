@@ -3,7 +3,10 @@
 //! Everything is stored in screenshot pixel coordinates so the same data can be
 //! drawn on screen (via [`Mapper`]) and rendered into the final image.
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, Shape as EShape, Stroke, StrokeKind, Vec2, pos2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Shape as EShape, Stroke, StrokeKind, Vec2, pos2, vec2};
+
+use super::text;
+use crate::tiles::TiledTexture;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelShape {
@@ -82,6 +85,7 @@ impl RoundPx for Rect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Adjust,
+    Move,
     Pen,
     Marker,
     Line,
@@ -91,11 +95,14 @@ pub enum Tool {
     Text,
     Step,
     Pixelate,
+    Blur,
+    Eraser,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 10] = [
+    pub const ALL: [Tool; 13] = [
         Tool::Adjust,
+        Tool::Move,
         Tool::Pen,
         Tool::Marker,
         Tool::Line,
@@ -105,11 +112,14 @@ impl Tool {
         Tool::Text,
         Tool::Step,
         Tool::Pixelate,
+        Tool::Blur,
+        Tool::Eraser,
     ];
 
     pub fn icon(self) -> &'static str {
         match self {
             Tool::Adjust => "⛶",
+            Tool::Move => "✋",
             Tool::Pen => "✏",
             Tool::Marker => "🖊",
             Tool::Line => "📏",
@@ -119,12 +129,16 @@ impl Tool {
             Tool::Text => "🔤",
             Tool::Step => "🔢",
             Tool::Pixelate => "🔲",
+            Tool::Blur => "💧",
+            // No eraser glyph in egui's fonts: the toolbar draws this one itself.
+            Tool::Eraser => "",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Tool::Adjust => "Move / resize selection",
+            Tool::Move => "Move annotations (drag anything you added)",
             Tool::Pen => "Pen",
             Tool::Marker => "Highlighter",
             Tool::Line => "Line",
@@ -134,6 +148,8 @@ impl Tool {
             Tool::Text => "Text",
             Tool::Step => "Numbered step",
             Tool::Pixelate => "Pixelate / hide",
+            Tool::Blur => "Blur",
+            Tool::Eraser => "Eraser (click or drag over annotations to delete them)",
         }
     }
 
@@ -141,6 +157,7 @@ impl Tool {
         use crate::shortcuts::Act;
         match self {
             Tool::Adjust => Act::ToolAdjust,
+            Tool::Move => Act::ToolMove,
             Tool::Pen => Act::ToolPen,
             Tool::Marker => Act::ToolMarker,
             Tool::Line => Act::ToolLine,
@@ -150,6 +167,8 @@ impl Tool {
             Tool::Text => Act::ToolText,
             Tool::Step => Act::ToolStep,
             Tool::Pixelate => Act::ToolPixelate,
+            Tool::Blur => Act::ToolBlur,
+            Tool::Eraser => Act::ToolEraser,
         }
     }
 
@@ -166,9 +185,11 @@ pub enum Shape {
     Arrow(Pos2, Pos2),
     Rect(Rect),
     Ellipse(Rect),
-    Text { pos: Pos2, text: String },
+    /// Top-left corner. With `box_width` the text wraps inside a box that wide.
+    Text { pos: Pos2, text: String, box_width: Option<f32> },
     Step { center: Pos2, number: u32 },
     Pixelate(Rect),
+    Blur(Rect),
 }
 
 #[derive(Clone, Debug)]
@@ -186,13 +207,95 @@ impl Annot {
         match &self.shape {
             Shape::Pen(pts) | Shape::Marker(pts) => pts.len() < 2,
             Shape::Line(a, b) | Shape::Arrow(a, b) => a.distance(*b) < 2.0,
-            Shape::Rect(r) | Shape::Ellipse(r) | Shape::Pixelate(r) => {
+            Shape::Rect(r) | Shape::Ellipse(r) | Shape::Pixelate(r) | Shape::Blur(r) => {
                 r.width() < 2.0 || r.height() < 2.0
             }
             Shape::Text { text, .. } => text.trim().is_empty(),
             Shape::Step { .. } => false,
         }
     }
+
+    pub fn translate(&mut self, d: Vec2) {
+        match &mut self.shape {
+            Shape::Pen(pts) | Shape::Marker(pts) => pts.iter_mut().for_each(|p| *p += d),
+            Shape::Line(a, b) | Shape::Arrow(a, b) => {
+                *a += d;
+                *b += d;
+            }
+            Shape::Rect(r) | Shape::Ellipse(r) | Shape::Pixelate(r) | Shape::Blur(r) => {
+                *r = r.translate(d);
+            }
+            Shape::Text { pos, .. } => *pos += d,
+            Shape::Step { center, .. } => *center += d,
+        }
+    }
+
+    /// Bounding box in image pixels.
+    pub fn bounds(&self) -> Rect {
+        let pad = match &self.shape {
+            Shape::Marker(_) => marker_width(self.width) / 2.0,
+            _ => self.width / 2.0,
+        };
+        match &self.shape {
+            Shape::Pen(pts) | Shape::Marker(pts) => Rect::from_points(pts).expand(pad),
+            Shape::Line(a, b) | Shape::Arrow(a, b) => Rect::from_two_pos(*a, *b).expand(pad),
+            Shape::Rect(r) | Shape::Ellipse(r) => r.expand(if self.filled { 0.0 } else { pad }),
+            Shape::Pixelate(r) | Shape::Blur(r) => *r,
+            Shape::Text { pos, text, box_width } => {
+                Rect::from_min_size(*pos, text::block_size(text, self.font_size, *box_width))
+            }
+            Shape::Step { center, .. } => {
+                Rect::from_center_size(*center, Vec2::splat(step_radius(self.width) * 2.0))
+            }
+        }
+    }
+
+    /// Whether `p` (image pixels) touches the annotation, with `tol` pixels of slack.
+    pub fn hit(&self, p: Pos2, tol: f32) -> bool {
+        let near_line = |pts: &[Pos2], half_width: f32| {
+            let reach = half_width + tol;
+            match pts {
+                [only] => only.distance(p) <= reach,
+                _ => pts.windows(2).any(|w| segment_distance(p, w[0], w[1]) <= reach),
+            }
+        };
+        match &self.shape {
+            Shape::Pen(pts) => near_line(pts, self.width / 2.0),
+            Shape::Marker(pts) => near_line(pts, marker_width(self.width) / 2.0),
+            Shape::Line(a, b) | Shape::Arrow(a, b) => near_line(&[*a, *b], self.width / 2.0),
+            Shape::Rect(r) if !self.filled => {
+                let reach = self.width / 2.0 + tol;
+                r.expand(reach).contains(p) && !r.shrink(reach).contains(p)
+            }
+            Shape::Ellipse(r) if !self.filled => {
+                let radii = r.size() / 2.0;
+                if radii.min_elem() < 1.0 {
+                    return r.expand(tol).contains(p);
+                }
+                let v = (p - r.center()) / radii;
+                (v.length() - 1.0).abs() * radii.min_elem() <= self.width / 2.0 + tol
+            }
+            Shape::Step { center, .. } => center.distance(p) <= step_radius(self.width) + tol,
+            _ => self.bounds().expand(tol).contains(p),
+        }
+    }
+}
+
+fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let len_sq = ab.length_sq();
+    if len_sq == 0.0 {
+        return p.distance(a);
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
+/// Pre-rendered copies of the screenshot that pixelate and blur annotations reveal.
+#[derive(Clone, Copy)]
+pub struct Effects<T> {
+    pub pixelated: Option<T>,
+    pub blurred: Option<T>,
 }
 
 pub fn marker_color(color: Color32) -> Color32 {
@@ -278,8 +381,7 @@ pub fn paint(
     painter: &egui::Painter,
     annot: &Annot,
     map: &Mapper,
-    pixelated: Option<egui::TextureId>,
-    img_size: Vec2,
+    effects: Effects<&TiledTexture>,
 ) {
     let stroke = Stroke::new(map.len(annot.width), annot.color);
     match &annot.shape {
@@ -324,14 +426,15 @@ pub fn paint(
                 painter.add(EShape::ellipse_stroke(r.center(), r.size() / 2.0, stroke));
             }
         }
-        Shape::Text { pos, text } => {
-            painter.text(
-                map.to_screen(*pos),
-                Align2::LEFT_TOP,
-                text,
-                FontId::proportional(map.len(annot.font_size)),
-                annot.color,
-            );
+        Shape::Text { pos, text, box_width } => {
+            // Lines are placed one by one so they break where the export breaks them.
+            let font = FontId::proportional(map.len(annot.font_size));
+            let line_height = text::line_height(annot.font_size);
+            for (i, line) in text::lines(text, annot.font_size, *box_width).iter().enumerate() {
+                let top = *pos + vec2(0.0, i as f32 * line_height);
+                let shown = text::visual(line);
+                painter.text(map.to_screen(top), Align2::LEFT_TOP, shown, font.clone(), annot.color);
+            }
         }
         Shape::Step { center, number } => {
             let c = map.to_screen(*center);
@@ -345,20 +448,67 @@ pub fn paint(
                 contrast_text(annot.color),
             );
         }
-        Shape::Pixelate(r) => {
+        Shape::Pixelate(r) | Shape::Blur(r) => {
             let screen = map.rect(*r);
-            match pixelated {
-                Some(tex) => {
-                    let uv = Rect::from_min_max(
-                        pos2(r.min.x / img_size.x, r.min.y / img_size.y),
-                        pos2(r.max.x / img_size.x, r.max.y / img_size.y),
-                    );
-                    painter.image(tex, screen, uv, Color32::WHITE);
-                }
+            let source = match annot.shape {
+                Shape::Blur(_) => effects.blurred,
+                _ => effects.pixelated,
+            };
+            match source {
+                Some(tex) => tex.paint(painter, *r, screen, Color32::WHITE),
                 None => {
                     painter.rect_filled(screen, 0.0, Color32::from_gray(128));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn annot(shape: Shape, filled: bool) -> Annot {
+        Annot {
+            shape,
+            color: Color32::RED,
+            width: 4.0,
+            filled,
+            font_size: 20.0,
+        }
+    }
+
+    #[test]
+    fn hits_strokes_and_outlines_but_not_empty_insides() {
+        let line = annot(Shape::Line(pos2(0.0, 0.0), pos2(100.0, 0.0)), false);
+        assert!(line.hit(pos2(50.0, 4.0), 3.0));
+        assert!(!line.hit(pos2(50.0, 20.0), 3.0));
+
+        let r = Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0));
+        let outline = annot(Shape::Rect(r), false);
+        assert!(outline.hit(pos2(10.0, 60.0), 3.0));
+        assert!(!outline.hit(pos2(60.0, 60.0), 3.0), "empty middle lets clicks through");
+        assert!(annot(Shape::Rect(r), true).hit(pos2(60.0, 60.0), 3.0));
+
+        let ring = annot(Shape::Ellipse(r), false);
+        assert!(ring.hit(pos2(110.0, 60.0), 3.0));
+        assert!(!ring.hit(pos2(60.0, 60.0), 3.0));
+
+        let boxed = Shape::Text { pos: pos2(0.0, 0.0), text: "Hi".into(), box_width: Some(200.0) };
+        let text = annot(boxed, false);
+        assert!(text.hit(pos2(150.0, 10.0), 0.0), "the whole box is grabbable");
+        assert!(!text.hit(pos2(250.0, 10.0), 0.0));
+    }
+
+    #[test]
+    fn translate_moves_every_point() {
+        let mut pen = annot(Shape::Pen(vec![pos2(1.0, 1.0), pos2(5.0, 5.0)]), false);
+        pen.translate(Vec2::new(10.0, -1.0));
+        let Shape::Pen(pts) = &pen.shape else { unreachable!() };
+        assert_eq!(pts, &vec![pos2(11.0, 0.0), pos2(15.0, 4.0)]);
+
+        let mut blur = annot(Shape::Blur(Rect::from_min_max(pos2(0.0, 0.0), pos2(4.0, 4.0))), false);
+        blur.translate(Vec2::splat(2.0));
+        assert!(matches!(blur.shape, Shape::Blur(r) if r.min == pos2(2.0, 2.0)));
     }
 }

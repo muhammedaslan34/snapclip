@@ -142,17 +142,13 @@ impl App {
 
     fn open(&mut self, event_loop: &ActiveEventLoop, attrs: WindowAttributes, view: Box<dyn View>) {
         match HostWindow::new(event_loop, attrs, view, &self.proxy) {
-            Ok(mut window) => {
+            Ok(window) => {
                 let id = window.window.id();
-                // Windows never sends a redraw to a hidden window, so paint the first
-                // frame now; `redraw` makes the window visible once it has content.
-                let mut commands = Vec::new();
-                let close = window.redraw(&mut self.shared, &mut commands);
                 self.windows.insert(id, window);
-                if close {
-                    self.close(id);
-                }
-                self.run_commands(event_loop, commands);
+                // Paint the first frame now: the window stays hidden until then, and
+                // Windows doesn't send WM_PAINT to hidden windows, so request_redraw
+                // would never arrive.
+                self.redraw(event_loop, id);
             }
             Err(err) => {
                 log::error!("cannot open window: {err:#}");
@@ -175,6 +171,18 @@ impl App {
             }
             None => false,
         }
+    }
+
+    /// Runs the window's UI, paints it and executes the commands it produced.
+    fn redraw(&mut self, event_loop: &ActiveEventLoop, id: WindowId) {
+        let Some(window) = self.windows.get_mut(&id) else {
+            return;
+        };
+        let mut commands = Vec::new();
+        if window.redraw(&mut self.shared, &mut commands) {
+            self.close(id);
+        }
+        self.run_commands(event_loop, commands);
     }
 
     fn redraw_kind(&self, kind: ViewKind) {
@@ -345,9 +353,11 @@ impl App {
         }
         let status = ScrollStatus {
             state: Arc::new(AtomicU8::new(scroll::RUNNING)),
-            auto_scroll: Arc::new(AtomicBool::new(cfg!(windows))),
+            // Off by default: auto-scroll has to move the mouse, which surprises people.
+            auto_scroll: Arc::new(AtomicBool::new(false)),
             frames: 1,
             height: region.height,
+            lost: false,
         };
         scroll::spawn(region, &status, self.proxy.clone());
         self.shared.scroll = Some(status);
@@ -378,6 +388,10 @@ impl App {
             attrs = attrs.with_position(PhysicalPosition::new(x, y));
         }
         self.open(event_loop, attrs, Box::new(ScrollControlView));
+        // It may have to sit on top of the region; keep it out of the frames.
+        if let Some(w) = self.find(ViewKind::ScrollControl).and_then(|id| self.windows.get(&id)) {
+            platform::exclude_from_capture(&w.window);
+        }
     }
 
     fn open_pin(&mut self, event_loop: &ActiveEventLoop, image: RgbaImage, pos: (i32, i32)) {
@@ -407,6 +421,11 @@ impl App {
                             self.run_commands(event_loop, vec![Command::SaveImageAs(image.clone())]);
                             "Screenshot captured"
                         }
+                        _ if self.shared.settings.auto_save => {
+                            self.copy_image(image.clone());
+                            self.save_now(image.clone());
+                            "Copied and saved"
+                        }
                         _ => {
                             self.copy_image(image.clone());
                             "Copied to clipboard"
@@ -422,7 +441,12 @@ impl App {
                 }
                 Command::OpenEditor(image) => self.open_editor(event_loop, image),
                 Command::ScrollCapture(region) => self.start_scroll(event_loop, region),
-                Command::CopyImage(image) => self.copy_image(image),
+                Command::CopyImage(image) => {
+                    if self.shared.settings.auto_save {
+                        self.save_now(image.clone());
+                    }
+                    self.copy_image(image);
+                }
                 Command::SaveImage(image) => self.save_now(image),
                 Command::SaveImageAs(image) => {
                     let dir = self.shared.settings.save_dir.clone();
@@ -440,7 +464,12 @@ impl App {
                         }
                     });
                 }
-                Command::Pin(image, pos) => self.open_pin(event_loop, image, pos),
+                Command::Pin(image, pos) => {
+                    if self.shared.settings.auto_save {
+                        self.save_now(image.clone());
+                    }
+                    self.open_pin(event_loop, image, pos);
+                }
                 Command::PasteItem(id) => self.paste_item(id),
                 Command::OpenSettings => self.open_settings(event_loop),
                 Command::ApplySettings => self.apply_settings(),
@@ -593,10 +622,11 @@ impl ApplicationHandler<AppEvent> for App {
                     w.schedule_repaint(delay);
                 }
             }
-            AppEvent::Scroll(ScrollMsg::Progress { frames, height }) => {
+            AppEvent::Scroll(ScrollMsg::Progress { frames, height, lost }) => {
                 if let Some(status) = &mut self.shared.scroll {
                     status.frames = frames;
                     status.height = height;
+                    status.lost = lost;
                 }
                 self.redraw_kind(ViewKind::ScrollControl);
             }
@@ -604,6 +634,10 @@ impl ApplicationHandler<AppEvent> for App {
                 self.shared.scroll = None;
                 self.close_kind(ViewKind::ScrollControl);
                 if let Some(image) = image {
+                    // A long capture is slow to redo, so keep a copy right away.
+                    if self.shared.settings.auto_save {
+                        self.save_now(image.clone());
+                    }
                     self.open_editor(event_loop, image);
                 }
             }
@@ -635,11 +669,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let mut commands = Vec::new();
-                if window.redraw(&mut self.shared, &mut commands) {
-                    self.close(id);
-                }
-                self.run_commands(event_loop, commands);
+                self.redraw(event_loop, id);
                 return;
             }
             _ => {}

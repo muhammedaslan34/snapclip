@@ -251,6 +251,13 @@ impl View for SettingsView {
                             .radio_value(&mut cx.shared.settings.after_capture, value, label)
                             .changed();
                     }
+                    ui.add_space(4.0);
+                    changed |= ui
+                        .checkbox(
+                            &mut cx.shared.settings.auto_save,
+                            "Also save screenshots I copy, pin or capture by scrolling to the save folder",
+                        )
+                        .changed();
                     if changed {
                         cx.commands.push(Command::ApplySettings);
                     }

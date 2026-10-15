@@ -1,6 +1,6 @@
 //! Renders the selection plus annotations into the final image (CPU, tiny-skia).
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use ab_glyph::{Font, FontRef, ScaleFont};
 use egui::{Color32, Pos2, Rect, Vec2};
 use image::RgbaImage;
 use tiny_skia::{
@@ -8,18 +8,14 @@ use tiny_skia::{
 };
 
 use super::annot::{
-    Annot, SelShape, Selection, Shape, arrow_geometry, contrast_text, marker_color, marker_width,
+    Annot, Effects, SelShape, Selection, Shape, arrow_geometry, contrast_text, marker_color, marker_width,
     step_radius,
 };
-
-/// Same font egui uses for proportional text, so the export matches the screen.
-fn font() -> Option<FontRef<'static>> {
-    FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).ok()
-}
+use super::text;
 
 pub fn export(
     shot: &RgbaImage,
-    pixelated: Option<&RgbaImage>,
+    effects: Effects<&RgbaImage>,
     sel: &Selection,
     annots: &[Annot],
 ) -> Option<RgbaImage> {
@@ -37,9 +33,9 @@ pub fn export(
 
     let offset = Vec2::new(x0 as f32, y0 as f32);
     let ts = Transform::from_translate(-offset.x, -offset.y);
-    let font = font();
+    let font = text::font();
     for annot in annots {
-        draw(&mut pixmap, annot, ts, offset, pixelated, font.as_ref());
+        draw(&mut pixmap, annot, ts, offset, effects, font);
     }
 
     if sel.shape != SelShape::Rect {
@@ -127,7 +123,7 @@ fn draw(
     annot: &Annot,
     ts: Transform,
     offset: Vec2,
-    pixelated: Option<&RgbaImage>,
+    effects: Effects<&RgbaImage>,
     font: Option<&FontRef<'_>>,
 ) {
     let paint = paint_for(annot.color);
@@ -181,9 +177,10 @@ fn draw(
                 }
             }
         }
-        Shape::Text { pos, text } => {
+        Shape::Text { pos, text, box_width } => {
             if let Some(font) = font {
-                draw_text(pm, font, text, *pos - offset, annot.font_size, annot.color);
+                let lines = text::lines(text, annot.font_size, *box_width);
+                draw_text(pm, font, &lines, *pos - offset, annot.font_size, annot.color);
             }
         }
         Shape::Step { center, number } => {
@@ -194,49 +191,47 @@ fn draw(
             if let Some(font) = font {
                 let label = number.to_string();
                 let size = r * 1.15;
-                let (tw, th) = measure_text(font, &label, size);
+                let (tw, th) = (text::width(&label, size), text::glyph_height(size));
                 let top_left = *center - offset - Vec2::new(tw / 2.0, th / 2.0);
-                draw_text(pm, font, &label, top_left, size, contrast_text(annot.color));
+                draw_text(pm, font, &[label], top_left, size, contrast_text(annot.color));
             }
         }
-        Shape::Pixelate(r) => {
-            if let Some(pixelated) = pixelated {
-                copy_region(pm, pixelated, offset.x as u32, offset.y as u32, r.translate(-offset));
+        Shape::Pixelate(r) | Shape::Blur(r) => {
+            let source = match annot.shape {
+                Shape::Blur(_) => effects.blurred,
+                _ => effects.pixelated,
+            };
+            if let Some(source) = source {
+                copy_region(pm, source, offset.x as u32, offset.y as u32, r.translate(-offset));
             }
         }
     }
 }
 
-/// ab_glyph scales by `ascent - descent`; egui sizes fonts by em. Convert em → ab_glyph scale.
-fn px_scale(font: &FontRef<'_>, em_size: f32) -> PxScale {
-    let upem = font.units_per_em().unwrap_or(1000.0);
-    PxScale::from(em_size * font.height_unscaled() / upem)
-}
-
-fn measure_text(font: &FontRef<'_>, text: &str, size: f32) -> (f32, f32) {
-    let scaled = font.as_scaled(px_scale(font, size));
-    let width = text.chars().map(|c| scaled.h_advance(scaled.glyph_id(c))).sum();
-    (width, scaled.height())
-}
-
-fn draw_text(pm: &mut Pixmap, font: &FontRef<'_>, text: &str, origin: Pos2, size: f32, color: Color32) {
-    let scale = px_scale(font, size);
-    let scaled = font.as_scaled(scale);
-    let line_height = scaled.height() + scaled.line_gap();
+/// Draws `lines` (in typing order) top-down from `origin`, each in display order.
+/// `main` sets the baseline; letters it lacks (e.g. Arabic) come from the fallback font.
+fn draw_text(pm: &mut Pixmap, main: &FontRef<'_>, lines: &[String], origin: Pos2, size: f32, color: Color32) {
+    let ascent = main.as_scaled(text::px_scale(main, size)).ascent();
+    let line_height = text::line_height(size);
     let [cr, cg, cb, ca] = color.to_srgba_unmultiplied();
     let (pw, ph) = (pm.width() as i32, pm.height() as i32);
     let data = pm.data_mut();
 
-    for (line_no, line) in text.split('\n').enumerate() {
-        let baseline = origin.y + scaled.ascent() + line_no as f32 * line_height;
+    for (line_no, line) in lines.iter().enumerate() {
+        let baseline = origin.y + ascent + line_no as f32 * line_height;
         let mut x = origin.x;
-        let mut prev = None;
-        for ch in line.chars() {
+        let mut prev: Option<(&FontRef<'_>, ab_glyph::GlyphId)> = None;
+        for ch in text::visual(line).chars() {
+            let Some(font) = text::font_for(ch) else { continue };
+            let scale = text::px_scale(font, size);
+            let scaled = font.as_scaled(scale);
             let id = scaled.glyph_id(ch);
-            if let Some(prev) = prev {
-                x += scaled.kern(prev, id);
+            if let Some((prev_font, prev_id)) = prev {
+                if std::ptr::eq(prev_font, font) {
+                    x += scaled.kern(prev_id, id);
+                }
             }
-            prev = Some(id);
+            prev = Some((font, id));
             let glyph = id.with_scale_and_position(scale, ab_glyph::point(x, baseline));
             x += scaled.h_advance(id);
             let Some(outline) = font.outline_glyph(glyph) else {
@@ -288,9 +283,17 @@ pub fn pixelate(img: &RgbaImage, block: u32) -> RgbaImage {
     out
 }
 
+/// A blurred copy of `img`, strong enough to make text unreadable.
+pub fn blur(img: &RgbaImage) -> RgbaImage {
+    let sigma = (img.width().max(img.height()) as f32 / 250.0).max(6.0);
+    image::imageops::fast_blur(img, sigma)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NO_EFFECTS: Effects<&RgbaImage> = Effects { pixelated: None, blurred: None };
 
     fn shot() -> RgbaImage {
         RgbaImage::from_pixel(100, 80, image::Rgba([255, 255, 255, 255]))
@@ -310,7 +313,7 @@ mod tests {
     fn crops_to_selection_and_draws_annotations() {
         let sel = Selection::rect(Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(60.0, 50.0)), SelShape::Rect);
         let annots = [annot(Shape::Line(Pos2::new(10.0, 30.0), Pos2::new(60.0, 30.0)))];
-        let out = export(&shot(), None, &sel, &annots).unwrap();
+        let out = export(&shot(), NO_EFFECTS, &sel, &annots).unwrap();
         assert_eq!(out.dimensions(), (50, 40));
         assert_eq!(out.get_pixel(25, 20).0, [255, 0, 0, 255]);
         assert_eq!(out.get_pixel(25, 5).0, [255, 255, 255, 255]);
@@ -319,7 +322,7 @@ mod tests {
     #[test]
     fn ellipse_selection_is_transparent_outside() {
         let sel = Selection::rect(Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 80.0)), SelShape::Ellipse);
-        let out = export(&shot(), None, &sel, &[]).unwrap();
+        let out = export(&shot(), NO_EFFECTS, &sel, &[]).unwrap();
         assert_eq!(out.get_pixel(0, 0).0[3], 0);
         assert_eq!(out.get_pixel(50, 40).0[3], 255);
     }
@@ -328,10 +331,10 @@ mod tests {
     fn text_and_steps_render_pixels() {
         let sel = Selection::rect(Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 80.0)), SelShape::Rect);
         let annots = [
-            annot(Shape::Text { pos: Pos2::new(5.0, 5.0), text: "Hi".into() }),
+            annot(Shape::Text { pos: Pos2::new(5.0, 5.0), text: "Hi".into(), box_width: None }),
             annot(Shape::Step { center: Pos2::new(70.0, 50.0), number: 3 }),
         ];
-        let out = export(&shot(), None, &sel, &annots).unwrap();
+        let out = export(&shot(), NO_EFFECTS, &sel, &annots).unwrap();
         let red = |x0: u32, y0: u32, x1: u32, y1: u32| {
             (x0..x1).flat_map(|x| (y0..y1).map(move |y| (x, y))).filter(|&(x, y)| {
                 let p = out.get_pixel(x, y).0;
@@ -340,6 +343,34 @@ mod tests {
         };
         assert!(red(0, 0, 40, 35) > 20, "text should draw red pixels");
         assert!(red(55, 35, 85, 65) > 100, "step marker should draw a red circle");
+    }
+
+    #[test]
+    fn blur_reveals_blurred_copy_inside_its_rect() {
+        let img = RgbaImage::from_fn(100, 80, |x, _| {
+            image::Rgba(if x % 2 == 0 { [0, 0, 0, 255] } else { [255, 255, 255, 255] })
+        });
+        let blurred = blur(&img);
+        let sel = Selection::rect(Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 80.0)), SelShape::Rect);
+        let annots = [annot(Shape::Blur(Rect::from_min_max(Pos2::new(20.0, 20.0), Pos2::new(60.0, 60.0))))];
+        let effects = Effects { pixelated: None, blurred: Some(&blurred) };
+        let out = export(&img, effects, &sel, &annots).unwrap();
+        let gray = out.get_pixel(40, 40).0[0];
+        assert!((90..=165).contains(&gray), "stripes inside should average out, got {gray}");
+        assert_eq!(out.get_pixel(10, 10).0, img.get_pixel(10, 10).0, "outside stays sharp");
+    }
+
+    #[test]
+    fn text_box_wraps_in_the_export() {
+        let sel = Selection::rect(Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 80.0)), SelShape::Rect);
+        let words = "aa aa aa".to_owned();
+        let box_width = text::width("aa", 20.0) * 1.5;
+        let annots = [annot(Shape::Text { pos: Pos2::new(2.0, 2.0), text: words, box_width: Some(box_width) })];
+        let out = export(&shot(), NO_EFFECTS, &sel, &annots).unwrap();
+        let red_rows: Vec<u32> = (0..80).filter(|&y| (0..100).any(|x| out.get_pixel(x, y).0[1] < 120)).collect();
+        let span = (red_rows.last().unwrap() - red_rows[0]) as f32;
+        assert!(span > text::line_height(20.0) * 2.0, "three wrapped lines, got a {span} px tall block");
+        assert!((box_width.ceil() as u32 + 4..100).all(|x| (0..80).all(|y| out.get_pixel(x, y).0[1] > 200)));
     }
 
     #[test]

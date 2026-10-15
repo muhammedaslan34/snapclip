@@ -28,6 +28,8 @@ anyhow = "1.0.104"
 earcut = "0.4"
 egui-wgpu = { version = "0.36.2", features = ["winit", "wayland", "x11"] }
 pollster = "1.0.1"
+ar-reshaper = "1.5"
+unicode-bidi = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_Security"] }

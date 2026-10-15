@@ -31,6 +31,8 @@ pub struct Settings {
     /// Maximum number of unpinned clipboard items to keep.
     pub history_limit: usize,
     pub after_capture: AfterCapture,
+    /// Also save screenshots to `save_dir` when they are copied, pinned or scroll-captured.
+    pub auto_save: bool,
     /// Folder used by "Save" in the screenshot editor.
     pub save_dir: PathBuf,
     /// Last-used annotation style, restored the next time the editor opens.
@@ -53,6 +55,7 @@ impl Default for Settings {
             auto_paste: true,
             history_limit: 300,
             after_capture: AfterCapture::Notify,
+            auto_save: true,
             save_dir: pictures.join(APP_NAME),
             pen_color: [239, 68, 68, 255],
             pen_width: 4.0,

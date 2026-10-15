@@ -156,10 +156,16 @@ impl View for ScrollControlView {
             });
             let mut auto = status.auto_scroll.load(Ordering::Relaxed);
             let hint = if cfg!(windows) {
-                "Scrolls the page under the selection for you. Turn off to scroll by hand."
+                "Scrolls the page under the selection for you. Moving the mouse turns it off."
             } else {
                 "Scroll the page by hand; frames are stitched as you go."
             };
+            if status.lost {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "⚠ Scrolled too fast — scroll back up a little to continue",
+                );
+            }
             if ui
                 .add_enabled(cfg!(windows), egui::Checkbox::new(&mut auto, "Auto-scroll"))
                 .on_hover_text(hint)

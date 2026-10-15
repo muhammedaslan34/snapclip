@@ -8,10 +8,13 @@ It is written in Rust with egui. It runs in the system tray, starts with Windows
 **Screenshots** (default shortcut `Alt+Shift+S`, or left-click the tray icon)
 - Select a rectangle, ellipse or freehand area, or click once for the full screen.
 - Resize and move the selection with handles or the arrow keys. A magnifier shows pixel coordinates and color.
-- Annotate with pen, highlighter, line, arrow, rectangle, ellipse (outline or filled), text, numbered steps and pixelate (to hide private info).
+- Annotate with pen, highlighter, line, arrow, rectangle, ellipse (outline or filled), text, numbered steps, pixelate and blur (to hide private info).
+- Text: click to type, or drag to set a box width so the text wraps inside it.
+- Move tool (✋ `H`): drag anything you added to move it; drag the side handles of a text box to change its width.
+- Eraser (`X`): click an annotation, or drag across several, to delete them. 🗑 (`Ctrl+Delete`) clears everything; both can be undone.
 - Pick a color (10 presets or any custom color) and a thickness or font size. Undo/redo with `Ctrl+Z` / `Ctrl+Y`.
-- Copy (`Enter` / `Ctrl+C`), save to a folder (`Ctrl+S`), save as (`Ctrl+Shift+S`), or pin on screen (`Ctrl+P`).
-- **Scrolling capture** (📜 button): captures a long page. On Windows the page scrolls automatically; you can also scroll by hand. Frames are stitched together, and sticky footers appear only once.
+- Copy (`Enter` / `Ctrl+C`), save to a folder (`Ctrl+S`), save as (`Ctrl+Shift+S`), or pin on screen (`Ctrl+P`). Copied, pinned and scrolling screenshots are saved to the folder too; turn this off in Settings.
+- **Scrolling capture** (📜 button): captures a long page while you scroll it by hand. Frames are stitched together; fixed or sticky side menus and headers don't get in the way, and sticky footers appear only once. If you scroll too fast, the panel asks you to scroll back up a little and the capture continues without a gap. On Windows you can tick **Auto-scroll** to scroll for you; moving the mouse turns it off again.
 - After copying or saving, a notification with a preview appears. Click it to open the **editor**. In Settings you can switch this to open the editor right away, or do nothing.
 
 **Clipboard history** (default shortcut `Alt+Shift+V`)
