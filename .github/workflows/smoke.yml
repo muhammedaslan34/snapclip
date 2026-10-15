@@ -1,8 +1,10 @@
 name: smoke-test
 
-# Runs a released snapclip.exe on a clean Windows machine and collects
-# its log, crash events and screenshots. Trigger manually:
-#   gh workflow run smoke.yml -f tag=v0.1.0-beta.1
+# Runs snapclip.exe on a clean Windows machine and checks that its windows
+# really appear, that copied text reaches the clipboard history, and that the
+# global shortcut opens the clipboard panel. Trigger manually:
+#   gh workflow run smoke.yml                     (build this commit)
+#   gh workflow run smoke.yml -f tag=v0.1.0-beta.2  (test a release)
 on:
   workflow_dispatch:
     inputs:
@@ -29,48 +31,76 @@ jobs:
             cargo build --release
             Copy-Item target/release/snapclip.exe app/
           }
-          Get-ChildItem app
 
       - name: Run and observe
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          function Shot($name) {
-            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-            $bmp.Save("out/$name.png")
+          Add-Type @"
+          using System; using System.Text; using System.Collections.Generic;
+          using System.Runtime.InteropServices;
+          public static class W {
+            delegate bool EnumProc(IntPtr h, IntPtr l);
+            [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
+            [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+            [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+            public static List<string> List(uint pid) {
+              var r = new List<string>();
+              EnumWindows((h, l) => {
+                uint p; GetWindowThreadProcessId(h, out p);
+                var sb = new StringBuilder(256); GetWindowText(h, sb, 256);
+                if (p == pid && sb.Length > 0 && sb.ToString().Contains("Clip") || p == pid && sb.ToString().StartsWith("SnapClip"))
+                  r.Add((IsWindowVisible(h) ? "VISIBLE " : "hidden  ") + sb.ToString());
+                return true;
+              }, IntPtr.Zero);
+              return r;
+            }
+          }
+          "@
+          function Windows($label) {
+            Write-Host "--- windows: $label"
+            [W]::List($app.Id) | ForEach-Object { Write-Host "    $_" }
           }
           $exe = (Get-ChildItem app/*.exe | Select-Object -First 1).FullName
+          $log = "$env:LOCALAPPDATA\SnapClip\snapclip.log"
+          $history = "$env:LOCALAPPDATA\SnapClip\history.json"
 
-          foreach ($mode in "--settings", "--clipboard", "--capture") {
-            Write-Host "=== $mode ==="
-            $p = Start-Process $exe -ArgumentList $mode -PassThru
-            Start-Sleep 8
-            $p.Refresh()
-            Write-Host "running: $(-not $p.HasExited)  exit code: $($p.ExitCode)"
-            Shot ($mode.TrimStart('-'))
-            Get-Content "$env:LOCALAPPDATA\SnapClip\snapclip.log" -ErrorAction SilentlyContinue |
-              Tee-Object -FilePath "out/log-$($mode.TrimStart('-')).txt"
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            Start-Sleep 2
-          }
+          Write-Host "=== start by hand (should show Settings) ==="
+          $app = Start-Process $exe -PassThru
+          Start-Sleep 8
+          $app.Refresh(); Write-Host "running: $(-not $app.HasExited)"
+          Windows "after start"
 
-          Write-Host "=== second launch ==="
-          $first = Start-Process $exe -PassThru
-          Start-Sleep 6
-          Start-Process $exe -ArgumentList "--clipboard" -Wait
+          Write-Host "=== copy text ==="
+          Set-Clipboard -Value "smoke test clipboard text"
           Start-Sleep 3
-          Write-Host "instances: $((Get-Process | Where-Object { $_.Path -eq $exe }).Count)"
-          Shot "second-launch"
-          Stop-Process -Id $first.Id -Force -ErrorAction SilentlyContinue
+          if (Test-Path $history) { Get-Content $history } else { Write-Host "NO history.json" }
 
-          Write-Host "=== OpenGL info ==="
-          Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion
+          Write-Host "=== press Alt+Shift+V ==="
+          [W]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+          [W]::keybd_event(0x10, 0, 0, [UIntPtr]::Zero)
+          [W]::keybd_event(0x56, 0, 0, [UIntPtr]::Zero)
+          [W]::keybd_event(0x56, 0, 2, [UIntPtr]::Zero)
+          [W]::keybd_event(0x10, 0, 2, [UIntPtr]::Zero)
+          [W]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+          Start-Sleep 4
+          Windows "after Alt+Shift+V"
 
-          Write-Host "=== Application errors ==="
-          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 2 } -MaxEvents 10 -ErrorAction SilentlyContinue |
-            Format-List TimeCreated, ProviderName, Message | Tee-Object -FilePath out/events.txt
+          Write-Host "=== second launch with --clipboard ==="
+          Start-Process $exe -ArgumentList "--clipboard" -Wait
+          Start-Sleep 4
+          Windows "after --clipboard"
+
+          Write-Host "=== second launch with --capture ==="
+          Start-Process $exe -ArgumentList "--capture" -Wait
+          Start-Sleep 5
+          Windows "after --capture"
+
+          $app.Refresh(); Write-Host "still running: $(-not $app.HasExited)"
+          Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "=== log ==="
+          Get-Content $log -ErrorAction SilentlyContinue | Tee-Object -FilePath out/snapclip.log
 
       - uses: actions/upload-artifact@v4
         if: always()
